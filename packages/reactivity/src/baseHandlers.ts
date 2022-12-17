@@ -52,15 +52,20 @@ const shallowReadonlyGet = /*#__PURE__*/ createGetter(true, true)
 
 const arrayInstrumentations = /*#__PURE__*/ createArrayInstrumentations()
 
-function createArrayInstrumentations() {
+/**
+ * 重写数组原有的方法，可以在原有方法上增加其他逻辑
+ * reactive([a,b,c]).include(x) , 当x为变量时，x可能为a或b或c或其他的，x会变化，
+ * 所以数组里的a，b，c都需要收集(track)，当x变化时，触发更新(trigger)
+ */
+function  createArrayInstrumentations() {
   const instrumentations: Record<string, Function> = {}
   // instrument identity-sensitive Array methods to account for possible reactive
   // values
   ;(['includes', 'indexOf', 'lastIndexOf'] as const).forEach(key => {
     instrumentations[key] = function (this: unknown[], ...args: unknown[]) {
-      const arr = toRaw(this) as any
+      const arr = toRaw(this) as any // 换取原数组
       for (let i = 0, l = this.length; i < l; i++) {
-        track(arr, TrackOpTypes.GET, i + '')
+        track(arr, TrackOpTypes.GET, i + '') // 为数组中每一项收集依赖
       }
       // we run the method using the original args first (which may be reactive)
       const res = arr[key](...args)
@@ -74,12 +79,26 @@ function createArrayInstrumentations() {
   })
   // instrument length-altering mutation methods to avoid length being tracked
   // which leads to infinite loops in some cases (#2137)
+  /**
+   * 避免某些情况下，数组长度被修改造成无限循环，如：
+   * watchEffect(()=>{
+   *  arr.push(1)
+   * })
+   * watchEffect(()=>{
+   *  arr.push(2)
+   * })
+   * push 时会获取数组长度，从而触发更新，导致1和2无限被push，所以需要暂停跟踪，防止收集length的依赖
+   * effect(()=>{
+   *  arr.push(1) 不需要收集依赖，因为没有取值，没有get，不需要响应式更新视图
+   *  arr[0] arr.length 需要收集依赖，因为进行取值了，有get，需要响应式更新视图
+   * })
+   */
   ;(['push', 'pop', 'shift', 'unshift', 'splice'] as const).forEach(key => {
     instrumentations[key] = function (this: unknown[], ...args: unknown[]) {
-      pauseTracking()
+      pauseTracking() // 暂停跟踪  shouldTrack = false
       const res = (toRaw(this) as any)[key].apply(this, args)
-      resetTracking()
-      return res
+      resetTracking() // 重新跟踪
+      return res 
     }
   })
   return instrumentations
@@ -94,7 +113,7 @@ function createGetter(isReadonly = false, shallow = false) {
     } else if (key === ReactiveFlags.IS_SHALLOW) {
       return shallow
     } else if (
-      key === ReactiveFlags.RAW && // 已经被代理过了，使用toRaw 方法获取被代理对象的原始对象
+      key === ReactiveFlags.RAW && // 已经被代理过了，使用toRaw 方法获取被代理对象的原始对象 （target）
       receiver === // 从WeakMap里通过target（key），获取已经存储在WeakMap中的响应式对象（value）
         (isReadonly
           ? shallow
@@ -105,34 +124,55 @@ function createGetter(isReadonly = false, shallow = false) {
           : reactiveMap
         ).get(target)
     ) {
-      return target
+      return target // 返回原始对象
     }
 
-    const targetIsArray = isArray(target)
+    const targetIsArray = isArray(target) // target 是否是数组
 
+    /**
+     * 不是只读 && 是数组 && 并且这个key 在 arrayInstrumentations 中
+     * arrayInstrumentations : 'includes', 'indexOf', 'lastIndexOf','push', 'pop', 'shift', 'unshift', 'splice',
+     * 对数组的 'includes', 'indexOf', 'lastIndexOf','push', 'pop', 'shift', 'unshift', 'splice' 进行重写
+     */
     if (!isReadonly && targetIsArray && hasOwn(arrayInstrumentations, key)) {
       return Reflect.get(arrayInstrumentations, key, receiver)
     }
 
     const res = Reflect.get(target, key, receiver)
 
+    // 是 Symbol 类型 ? 是否是symbol上内置的属性方法（排除arguments 和 caller）: 是否是原型链上查找到的
+    // 不需要收集symbol 和 __proto__ 的依赖
     if (isSymbol(key) ? builtInSymbols.has(key) : isNonTrackableKeys(key)) {
       return res
     }
 
+    // 非只读，进行依赖收集
     if (!isReadonly) {
       track(target, TrackOpTypes.GET, key)
     }
 
+    // 如果是浅代理，返回的结果不需要再被代理
     if (shallow) {
       return res
     }
 
+    /**
+     * 第一种情况，let arr = reactive([ref(1),2,3])
+     * 是数组，并且key是数组下标，不拆包
+     * 需要arr[0].value 的方式来访问
+     * 
+     * 第二种情况, let r = reactive({
+     *  name:ref('test')
+     * })
+     * 这种情况需要对ref 拆包
+     * 使 r.name 相当于 r.name.value
+     */
     if (isRef(res)) {
       // ref unwrapping - skip unwrap for Array + integer key.
       return targetIsArray && isIntegerKey(key) ? res : res.value
     }
 
+    // 是对象，将返回的值再转化成响应式对象
     if (isObject(res)) {
       // Convert returned value into a proxy as well. we do the isObject check
       // here to avoid invalid value warning. Also need to lazy access readonly
@@ -158,11 +198,13 @@ function createSetter(shallow = false) {
     if (isReadonly(oldValue) && isRef(oldValue) && !isRef(value)) {
       return false
     }
-    if (!shallow) {
+    if (!shallow) { // 深度代理
       if (!isShallow(value) && !isReadonly(value)) {
         oldValue = toRaw(oldValue)
-        value = toRaw(value)
+        value = toRaw(value) // 如果设置的值被代理过，将value转换转换成普通对象再赋值，如 let proxy = reactive({name:1})  proxy.name = reactive({a:1}) 
       }
+      // target 不是数组， 老值是ref ，新的值不是ref
+      // let proxy = reactive({name:ref(1)}) 使 proxy.name = 2  相当于 proxy.name.value = 2
       if (!isArray(target) && isRef(oldValue) && !isRef(value)) {
         oldValue.value = value
         return true
